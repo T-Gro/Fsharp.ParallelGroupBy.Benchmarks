@@ -57,9 +57,28 @@ module CustomImpl =
 
         dict.ToArray() |> Array.Parallel.map (fun kvp -> (kvp.Key,kvp.Value.ToArray()))
 
+    let countByThenAssign projection array =       
+        let counts = new ConcurrentDictionary<_,_>(concurrencyLevel = maxPartitions, capacity = 20*2)
+        let valueFactory = new Func<_,_>(fun _ -> ref 0)
+        array |> Array.Parallel.iter (fun item ->             
+                    let counter = counts.GetOrAdd(projection item,valueFactory=valueFactory)
+                    System.Threading.Interlocked.Increment(counter) |> ignore)
+
+        let sortedCounts = counts.ToArray()
+        let finalResults = sortedCounts |> Array.Parallel.map (fun kvp -> (kvp.Key,Array.zeroCreate kvp.Value.Value))
+        let finalresultsLookup = finalResults |> dict
+        array |> Array.Parallel.iter (fun value ->
+            let key = projection value
+            let correctBucket = finalresultsLookup[key]
+            let idxToWrite = System.Threading.Interlocked.Decrement(counts[key])
+            correctBucket.[idxToWrite] <- value
+            )
+        finalResults
+
     let eachChunkSeparatelyThenMerge projection array = 
         let partitions = createPartitions array
         let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,ResizeArray<_>>(20*2)) // MAX. one entry per final key
+        // O (N / threads)
         Parallel.For(0,partitions.Length, fun i ->            
             let chunk = partitions[i]
             let localDict = resultsPerChunk[i]
@@ -75,6 +94,7 @@ module CustomImpl =
                     localDict.Add(key,newList)           
         )
 
+        // O ( threads * groups)
         let allResults = new Dictionary<_,ResizeArray<ResizeArray<_>>>(20*2)  // one entry per final key
         for i=0 to resultsPerChunk.Length-1 do
             let result = resultsPerChunk.[i]
@@ -88,6 +108,7 @@ module CustomImpl =
 
         let results = Array.zeroCreate allResults.Count
         let mutable partitionIdx = 0
+        // O(N)
         for kvp in allResults do
             let key = kvp.Key
             let values = kvp.Value
@@ -138,7 +159,7 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
     let r = new Random(42)
 
-    [<Params(100_000,10_000_000)>]      
+    [<Params(4_000,100_000,2_500_000)>]      
     member val NumberOfItems = -1 with get,set
 
     member val ArrayWithItems = Unchecked.defaultof<'T[]> with get,set
@@ -147,17 +168,21 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.GlobalSetup () = 
         this.ArrayWithItems <- Array.init this.NumberOfItems (fun idx -> 'T.Create(idx,r.NextDouble()))        
 
-    [<Benchmark>]
+    [<Benchmark(Baseline = true)>]
     member this.Sequential () = 
         this.ArrayWithItems |> SequentialImplementation.groupBy ('T.Projection())
 
-    [<Benchmark(Baseline = true)>]
+    [<Benchmark>]
     member this.PLINQDefault () = 
         this.ArrayWithItems |> PLINQImplementation.groupBy ('T.Projection())
 
     [<Benchmark>]
     member this.EachChunkSeparatelyThenMerge () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
+
+    [<Benchmark>]
+    member this.CountByThenAssign () = 
+        this.ArrayWithItems |> CustomImpl.countByThenAssign ('T.Projection())
 
     [<Benchmark>]
     member this.AtLestProjectionInParallel () = 
