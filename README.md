@@ -13,7 +13,7 @@ The benchmark uses three main profiles which differ in:
 - Especially for the combination of **many final buckets** AND **having a cheap projection function** the inner overhead of .groupBy implementation stands out.
 
 
-## Expensive projection, low number of buckets -> good for parallelism
+## Expensive projection, low number of buckets ====> good for parallelism
 ```fsharp
 type ReferenceRecord = {Id : int; Value : float}
     with interface IBenchMarkElement<ReferenceRecord> 
@@ -50,7 +50,7 @@ type ReferenceRecord = {Id : int; Value : float}
 
 
 
-## Reference record many buckets Easy projection, many buckets created - high overhead for constructing final arrays
+## Reference record with easy projection and  many buckets  ====> measures internal allocation overhead
 ```fsharp
 type ReferenceRecordManyBuckets = {Id : int; Value : float}
     with interface IBenchMarkElement<ReferenceRecordManyBuckets> 
@@ -84,7 +84,7 @@ type ReferenceRecordManyBuckets = {Id : int; Value : float}
 |         ConcurrentDictOfBags |       2500000 | 1,878,675.7 us | 120,924.87 us | 356,549.70 us |  6.67 |    1.18 |             294.0000 |        3840.0000 | 49000.0000 | 47000.0000 | 1000.0000 |   575914.65 KB |        7.22 |
 
 
-## Struct record - cheapest projection, low number of buckets. 
+## Struct record - cheapest projection, low number of buckets ====> this is the most expected scenario for high perf code
 ```fsharp
 [<Struct>]
 type StructRecord = {Id : int; Value : float}
