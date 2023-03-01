@@ -41,13 +41,11 @@ module CustomImpl =
                 yield new ArraySegment<'T>(array, offset, array.Length - offset)
         |]
 
-    let atLeastProjectionInParallel projection array = 
-        let projected = array |> Array.Parallel.map (fun x -> struct(projection x,x))
-        let groups = 
-            projected 
-            |> Array.groupBy (fun struct(key,value) -> key) 
-            |> Array.Parallel.map (fun (key,group) -> (key,group |> Array.map (fun struct(key,value) -> value)))
-        groups
+    let atLeastProjectionInParallel projection array =     
+        array 
+        |> Array.Parallel.map (fun x -> struct(projection x,x))
+        |> Array.groupBy (fun struct(key,value) -> key) 
+        |> Array.Parallel.map (fun (key,group) -> (key,group |> Array.map (fun struct(key,value) -> value)))
 
     let concurrentMultiDictionairy projection array = 
         let dict = new ConcurrentDictionary<_,_>()
