@@ -75,10 +75,11 @@ module CustomImpl =
             )
         finalResults
 
-    let eachChunkSeparatelyThenMerge projection array = 
+    let initialBucketingOnly projection array =       
+
         let partitions = createPartitions array
-        let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,ResizeArray<_>>(20*2)) // MAX. one entry per final key
-        // O (N / threads)
+        let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,ResizeArray<_>>()) // MAX. one entry per final key
+        // O (N / threads)      
         Parallel.For(0,partitions.Length, fun i ->            
             let chunk = partitions[i]
             let localDict = resultsPerChunk[i]
@@ -89,20 +90,42 @@ module CustomImpl =
                 match localDict.TryGetValue(key) with
                 | true, bucket -> bucket.Add(x)
                 | false, _ -> 
-                    let newList = new ResizeArray<_>(chunk.Count / 13)  // Slightly oversized so that does not have to grow
+                    let newList = new ResizeArray<_>()  // Slightly oversized so that does not have to grow
+                    newList.Add(x)
+                    localDict.Add(key,newList)           
+        )
+
+        resultsPerChunk
+
+    let eachChunkSeparatelyThenMerge projection array =     
+
+        let partitions = createPartitions array
+        let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,ResizeArray<_>>()) // MAX. one entry per final key
+        // O (N / threads)      
+        Parallel.For(0,partitions.Length, fun i ->            
+            let chunk = partitions[i]
+            let localDict = resultsPerChunk[i]
+            let lastOffset = chunk.Offset + chunk.Count - 1 
+            for i=chunk.Offset to lastOffset do
+                let x = array.[i]
+                let key = projection x
+                match localDict.TryGetValue(key) with
+                | true, bucket -> bucket.Add(x)
+                | false, _ -> 
+                    let newList = new ResizeArray<_>()  
                     newList.Add(x)
                     localDict.Add(key,newList)           
         )
 
         // O ( threads * groups)
-        let allResults = new Dictionary<_,ResizeArray<ResizeArray<_>>>(20*2)  // one entry per final key
+        let allResults = new Dictionary<_,ResizeArray<ResizeArray<_>>>()  // one entry per final key
         for i=0 to resultsPerChunk.Length-1 do
             let result = resultsPerChunk.[i]
             for kvp in result do
                 match allResults.TryGetValue(kvp.Key) with
                 | true, bucket -> bucket.Add(kvp.Value)
                 | false, _ -> 
-                    let newBuck = new ResizeArray<_>(maxPartitions) // MAX. one per partition, in theory less
+                    let newBuck = new ResizeArray<_>(partitions.Length) // MAX. one per partition, in theory less
                     newBuck.Add(kvp.Value)
                     allResults.Add(kvp.Key,newBuck)
 
@@ -181,14 +204,18 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
 
     [<Benchmark>]
+    member this.InitialBucketingOnlyNOTfullImpl () = 
+        this.ArrayWithItems |> CustomImpl.initialBucketingOnly ('T.Projection())
+
+    //[<Benchmark>]
     member this.CountByThenAssign () = 
         this.ArrayWithItems |> CustomImpl.countByThenAssign ('T.Projection())
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.AtLestProjectionInParallel () = 
         this.ArrayWithItems |> CustomImpl.atLeastProjectionInParallel ('T.Projection())
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.ConcurrentDictOfBags () = 
         this.ArrayWithItems |> CustomImpl.concurrentMultiDictionairy ('T.Projection())
 
