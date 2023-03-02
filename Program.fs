@@ -19,7 +19,7 @@ module PLINQImplementation =
 module CustomImpl =
     // The following two parameters were benchmarked and found to be optimal.
     // Benchmark was run using: 11th Gen Intel Core i9-11950H 2.60GHz, 1 CPU, 16 logical and 8 physical cores
-    let private maxPartitions = Environment.ProcessorCount/2 // The maximum number of partitions to use
+    let private maxPartitions = Environment.ProcessorCount // The maximum number of partitions to use
     let private sequentialCutoffForGrouping = 2_500 // Arrays smaller then this will be sorted sequentially
     let private minChunkSize = 64 // The minimum size of a chunk to be sorted in parallel
 
@@ -75,28 +75,6 @@ module CustomImpl =
             )
         finalResults
 
-    let initialBucketingOnly projection array =       
-
-        let partitions = createPartitions array
-        let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,ResizeArray<_>>()) // MAX. one entry per final key
-        // O (N / threads)      
-        Parallel.For(0,partitions.Length, fun i ->            
-            let chunk = partitions[i]
-            let localDict = resultsPerChunk[i]
-            let lastOffset = chunk.Offset + chunk.Count - 1 
-            for i=chunk.Offset to lastOffset do
-                let x = array.[i]
-                let key = projection x
-                match localDict.TryGetValue(key) with
-                | true, bucket -> bucket.Add(x)
-                | false, _ -> 
-                    let newList = new ResizeArray<_>()  // Slightly oversized so that does not have to grow
-                    newList.Add(x)
-                    localDict.Add(key,newList)           
-        )
-
-        resultsPerChunk
-
     let eachChunkSeparatelyThenMerge projection array =     
 
         let partitions = createPartitions array
@@ -112,7 +90,7 @@ module CustomImpl =
                 match localDict.TryGetValue(key) with
                 | true, bucket -> bucket.Add(x)
                 | false, _ -> 
-                    let newList = new ResizeArray<_>()  
+                    let newList = new ResizeArray<_>(1)  
                     newList.Add(x)
                     localDict.Add(key,newList)           
         )
@@ -143,6 +121,45 @@ module CustomImpl =
            
             results.[partitionIdx] <- (key,finalArrayForKey)
             partitionIdx <- partitionIdx + 1
+        results
+
+    let eachChunkSeparatelyViaList projection array =     
+
+        let partitions = createPartitions array
+        let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,Ref<list<_>>>()) // MAX. one entry per final key
+        // O (N / threads)      
+        Parallel.For(0,partitions.Length, fun i ->            
+            let chunk = partitions[i]
+            let localDict = resultsPerChunk[i]
+            let lastOffset = chunk.Offset + chunk.Count - 1 
+            for i=chunk.Offset to lastOffset do
+                let x = array.[i]
+                let key = projection x
+                match localDict.TryGetValue(key) with
+                | true, list ->                   
+                    list.Value <- x :: list.Value
+                | false, _ ->                
+                    localDict.Add(key,ref [x])                 
+        )
+
+        // O ( threads * groups)
+        let resultsPerKey = new Dictionary<_,_>(resultsPerChunk[0].Count * 2)  // one entry per final key
+        for i=0 to resultsPerChunk.Length-1 do
+            let result = resultsPerChunk.[i]
+            for kvp in result do
+                match resultsPerKey.TryGetValue(kvp.Key) with
+                | false, _ -> resultsPerKey.Add(kvp.Key,kvp.Value) 
+                | true, list -> list.Value <- kvp.Value.Value @ list.Value
+                
+
+        let results = Array.zeroCreate resultsPerKey.Count
+        let nonFlattenResults = resultsPerKey.ToArray()
+
+        Parallel.For(0,nonFlattenResults.Length, fun i ->            
+            let kvp = nonFlattenResults.[i] 
+            results.[i] <- (kvp.Key,kvp.Value.Value |> List.toArray)
+        )
+      
         results
 
       
@@ -182,7 +199,7 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
     let r = new Random(42)
 
-    [<Params(4_000,100_000,2_500_000)>]      
+    [<Params(500,4_000,100_000,2_500_000)>]      
     member val NumberOfItems = -1 with get,set
 
     member val ArrayWithItems = Unchecked.defaultof<'T[]> with get,set
@@ -204,8 +221,8 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
 
     [<Benchmark>]
-    member this.InitialBucketingOnlyNOTfullImpl () = 
-        this.ArrayWithItems |> CustomImpl.initialBucketingOnly ('T.Projection())
+    member this.EachChunkSeparatelyThenMerge () = 
+        this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyViaList ('T.Projection())
 
     //[<Benchmark>]
     member this.CountByThenAssign () = 
