@@ -10,11 +10,16 @@ open BenchmarkDotNet.Diagnosers
 
 module SequentialImplementation = 
     let groupBy = Array.groupBy
+    let sortBy = Array.sortBy
 
 module PLINQImplementation = 
     let groupBy (projection) (array:'T array) = 
         let projection = Func<_,_>(projection)
         array.AsParallel().GroupBy(projection).Select(fun x -> (x.Key,x.ToArray())).ToArray()
+
+    let sortBy (projection) (array:'T array) = 
+        let projection = Func<_,_>(projection)
+        array.AsParallel().OrderBy(projection).ToArray()
 
 module CustomImpl =
     // The following two parameters were benchmarked and found to be optimal.
@@ -75,14 +80,34 @@ module CustomImpl =
             )
         finalResults
 
+    let inline sortThenCreateGroups ([<InlineIfLambda>]projection) array = 
+        let sorted = Array.sortBy projection array
+        let segments = new ResizeArray<_>(1024)
+        let mutable lastKey = projection sorted.[0]
+        let mutable lastKeyIndex = 0
+        for i=1 to sorted.Length-1 do
+            let currentKey = projection sorted.[i]
+            if currentKey <> lastKey then
+                segments.Add(lastKey,new ArraySegment<'T>(sorted,lastKeyIndex, i - lastKeyIndex))
+                lastKey <- currentKey
+                lastKeyIndex <- i
+
+        segments.Add(lastKey,new ArraySegment<'T>(sorted,lastKeyIndex, sorted.Length - lastKeyIndex))
+        segments.ToArray()
+
+    let inline sortThenCreateGroupsToArray ([<InlineIfLambda>]projection) array =
+        let g = sortThenCreateGroups projection array
+        g |> Array.Parallel.map (fun (key,segment) -> (key,segment.ToArray()))
+
     let eachChunkSeparatelyThenMerge projection array =     
 
         let partitions = createPartitions array
-        let resultsPerChunk = Array.init partitions.Length (fun _ -> new Dictionary<_,ResizeArray<_>>()) // MAX. one entry per final key
+        let resultsPerChunk = Array.zeroCreate partitions.Length
         // O (N / threads)      
         Parallel.For(0,partitions.Length, fun i ->            
             let chunk = partitions[i]
-            let localDict = resultsPerChunk[i]
+            let localDict = new Dictionary<_,ResizeArray<_>>(partitions.Length)
+            resultsPerChunk[i] <- localDict
             let lastOffset = chunk.Offset + chunk.Count - 1 
             for i=chunk.Offset to lastOffset do
                 let x = array.[i]
@@ -92,8 +117,8 @@ module CustomImpl =
                 | false, _ -> 
                     let newList = new ResizeArray<_>(1)  
                     newList.Add(x)
-                    localDict.Add(key,newList)           
-        )
+                    localDict.Add(key,newList))           
+
 
         // O ( threads * groups)
         let allResults = new Dictionary<_,ResizeArray<ResizeArray<_>>>()  // one entry per final key
@@ -107,20 +132,66 @@ module CustomImpl =
                     newBuck.Add(kvp.Value)
                     allResults.Add(kvp.Key,newBuck)
 
-        let results = Array.zeroCreate allResults.Count
-        let mutable partitionIdx = 0
-        // O(N)
-        for kvp in allResults do
-            let key = kvp.Key
-            let values = kvp.Value
-            let finalArrayForKey = Array.zeroCreate (values |> Seq.sumBy (fun x -> x.Count))
+        let results = Array.zeroCreate allResults.Count   
+        let nonFlattenResults = allResults.ToArray()
+
+        Parallel.For(0,nonFlattenResults.Length, fun i ->            
+            let kvp = nonFlattenResults.[i] 
+            let finalArrayForKey = Array.zeroCreate (kvp.Value |> Seq.sumBy (fun x -> x.Count))
             let mutable finalArrayOffset = 0
-            for bucket in values do
+            for bucket in kvp.Value do
                 bucket.CopyTo(finalArrayForKey,finalArrayOffset)
                 finalArrayOffset <- finalArrayOffset + bucket.Count
            
-            results.[partitionIdx] <- (key,finalArrayForKey)
-            partitionIdx <- partitionIdx + 1
+            results.[i] <- (kvp.Key,finalArrayForKey)
+        )
+        results
+
+    let fullyOnParallelFor projection array =
+        let resultsBag = new ConcurrentBag<_>()
+
+        Parallel.For(0, Array.length array, 
+            localInit = (fun () -> new Dictionary<_,ResizeArray<_>>()), 
+            body = (fun idx _ (pLocal:Dictionary<_,ResizeArray<_>>) ->
+                let x = array.[idx]
+                let key = projection x
+                match pLocal.TryGetValue(key) with
+                | true, bucket -> bucket.Add(x)
+                | false, _ -> 
+                    let newList = new ResizeArray<_>(1)  
+                    newList.Add(x)
+                    pLocal.Add(key,newList)
+                pLocal ), 
+            localFinally = (fun pLocal -> resultsBag.Add(pLocal)))
+         
+
+        let resultsPerChunk = resultsBag.ToArray()
+
+        // O ( threads * groups)
+        let allResults = new Dictionary<_,ResizeArray<ResizeArray<_>>>()  // one entry per final key
+        for i=0 to resultsPerChunk.Length-1 do
+            let result = resultsPerChunk.[i]
+            for kvp in result do
+                match allResults.TryGetValue(kvp.Key) with
+                | true, bucket -> bucket.Add(kvp.Value)
+                | false, _ -> 
+                    let newBuck = new ResizeArray<_>(resultsPerChunk.Length) // MAX. one per partition, in theory less
+                    newBuck.Add(kvp.Value)
+                    allResults.Add(kvp.Key,newBuck)
+
+        let results = Array.zeroCreate allResults.Count   
+        let nonFlattenResults = allResults.ToArray()
+
+        Parallel.For(0,nonFlattenResults.Length, fun i ->            
+            let kvp = nonFlattenResults.[i] 
+            let finalArrayForKey = Array.zeroCreate (kvp.Value |> Seq.sumBy (fun x -> x.Count))
+            let mutable finalArrayOffset = 0
+            for bucket in kvp.Value do
+                bucket.CopyTo(finalArrayForKey,finalArrayOffset)
+                finalArrayOffset <- finalArrayOffset + bucket.Count
+           
+            results.[i] <- (kvp.Key,finalArrayForKey)
+        )
         results
 
     let eachChunkSeparatelyViaList projection array =     
@@ -194,7 +265,7 @@ type StructRecord = {Id : int; Value : float}
 [<GenericTypeArguments(typeof<ReferenceRecord>)>]
 [<GenericTypeArguments(typeof<ReferenceRecordManyBuckets>)>]
 [<GenericTypeArguments(typeof<StructRecord>)>]
-//[<DryJob>]  // Uncomment heere for quick local testing
+//[<ShortRunJob>]//[<DryJob>]  // Uncomment heere for quick local testing
 type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() = 
 
     let r = new Random(42)
@@ -212,27 +283,47 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.Sequential () = 
         this.ArrayWithItems |> SequentialImplementation.groupBy ('T.Projection())
 
+    [<Benchmark()>]
+    member this.SortJustForReference () = 
+        this.ArrayWithItems |> SequentialImplementation.sortBy ('T.Projection())
+
+    [<Benchmark()>]
+    member this.SortThenCreateGroups () = 
+        this.ArrayWithItems |> CustomImpl.sortThenCreateGroups ('T.Projection())
+
+    [<Benchmark()>]
+    member this.SortThenCreateGroupsToArray () = 
+        this.ArrayWithItems |> CustomImpl.sortThenCreateGroupsToArray ('T.Projection())
+
     [<Benchmark>]
     member this.PLINQDefault () = 
         this.ArrayWithItems |> PLINQImplementation.groupBy ('T.Projection())
+
+    //[<Benchmark>]
+    member this.PlinqSortForReference () = 
+        this.ArrayWithItems |> PLINQImplementation.sortBy ('T.Projection())
 
     [<Benchmark>]
     member this.EachChunkSeparatelyThenMerge () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
 
-    [<Benchmark>]
-    member this.EachChunkSeparatelyThenMerge () = 
+    //[<Benchmark>]
+    member this.ParallelForImpl () = 
+        this.ArrayWithItems |> CustomImpl.fullyOnParallelFor ('T.Projection())
+
+    //[<Benchmark>] - slow because of list (:: , @) allocations and copies
+    member this.EachChunkSeparatelyThenMergeViaList () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyViaList ('T.Projection())
 
-    //[<Benchmark>]
+    //[<Benchmark>] - in general slower than EachChunkSeparatelyThenMerge
     member this.CountByThenAssign () = 
         this.ArrayWithItems |> CustomImpl.countByThenAssign ('T.Projection())
 
-    //[<Benchmark>]
+    //[<Benchmark>] - too many allocations, doing work twice
     member this.AtLestProjectionInParallel () = 
         this.ArrayWithItems |> CustomImpl.atLeastProjectionInParallel ('T.Projection())
 
-    //[<Benchmark>]
+    //[<Benchmark>] - lock contentions are too big of an disadvantage
     member this.ConcurrentDictOfBags () = 
         this.ArrayWithItems |> CustomImpl.concurrentMultiDictionairy ('T.Projection())
 
