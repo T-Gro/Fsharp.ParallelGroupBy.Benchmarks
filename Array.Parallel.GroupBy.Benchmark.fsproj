@@ -6,6 +6,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="Shared.fs" />
+    <Compile Include="Sorting.fs" />
+    <Compile Include="JunkyardOfBadIdeas.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
