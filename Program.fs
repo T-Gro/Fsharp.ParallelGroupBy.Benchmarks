@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open BenchmarkDotNet.Attributes
 open BenchmarkDotNet.Running
 open BenchmarkDotNet.Diagnosers
+open BenchmarkDotNet.Diagnostics.Windows.Configs;
 
 
 module SequentialImplementation = 
@@ -43,6 +44,7 @@ module CustomImpl =
 
         let partitions = Shared.createPartitions array
         let possiblyOverlappingSegments = Array.zeroCreate partitions.Length
+      
 
         Parallel.For(0, partitions.Length, fun partitionIdx ->
             let segments = new ResizeArray<_>()
@@ -173,6 +175,7 @@ type StructRecord = {Id : int; Value : float}
 
 
 [<MemoryDiagnoser>]
+[<EtwProfiler>]
 [<ThreadingDiagnoser>]
 [<GenericTypeArguments(typeof<ReferenceRecord>)>]
 [<GenericTypeArguments(typeof<ReferenceRecordManyBuckets>)>]
@@ -182,7 +185,7 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
     let r = new Random(42)
 
-    [<Params(500,4_000,100_000,2_500_000)>]      
+    [<Params(100_000)>]   //[<Params(500,4_000,100_000,2_500_000)>]      
     member val NumberOfItems = -1 with get,set
 
     member val ArrayWithItems = Unchecked.defaultof<'T[]> with get,set
@@ -191,20 +194,20 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.GlobalSetup () = 
         this.ArrayWithItems <- Array.init this.NumberOfItems (fun idx -> 'T.Create(idx,r.NextDouble()))        
 
-    [<Benchmark(Baseline = true)>]
+    //[<Benchmark(Baseline = true)>]
     member this.Sequential () = 
         this.ArrayWithItems |> SequentialImplementation.groupBy ('T.Projection())
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.PLINQDefault () = 
         this.ArrayWithItems |> PLINQImplementation.groupBy ('T.Projection())
 
 
-    [<Benchmark()>]
+    //[<Benchmark()>]
     member this.SortThenCreateGroups () = 
         this.ArrayWithItems |> CustomImpl.sortThenCreateGroups ('T.Projection())
 
-    [<Benchmark()>]
+    //[<Benchmark()>]
     member this.GroupByInPlaceViaSort () = 
         this.ArrayWithItems |> CustomImpl.groupByInPlaceViaSort ('T.Projection())
 
@@ -212,7 +215,7 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.EachChunkSeparatelyThenMerge () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
 
-    [<Benchmark()>]
+    //[<Benchmark()>]
     member this.GroupByInPlaceViaSortAndParallelSegmentation () = 
         this.ArrayWithItems |> CustomImpl.groupByInPlaceViaSortAndParallelSegmentation ('T.Projection())
 

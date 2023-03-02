@@ -5,14 +5,20 @@ open System.Threading.Tasks
 
 
 
-let private prepareSortedRunsInPlace array keysArray =
+let private prepareSortedRunsInPlace (array:array<_>) (keysArray:array<_>) projection =
     let partitions = Shared.createPartitions array
     let keyComparer = LanguagePrimitives.FastGenericComparer
 
     Parallel.For(
         0,
         partitions.Length,
-        fun i -> Array.Sort<_, _>(keysArray, array, partitions[i].Offset, partitions[i].Count, keyComparer)
+        fun i -> 
+            let p = partitions[i]
+            let finalIdx = p.Offset+p.Count-1
+            for i=p.Offset to finalIdx do
+                keysArray[i] <- (projection array[i])
+
+            Array.Sort<_, _>(keysArray, array, partitions[i].Offset, partitions[i].Count, keyComparer)
     )
     |> ignore
 
@@ -72,8 +78,8 @@ let sortInPlaceBy (projection: 'T -> 'U) (array: 'T[]) =
         Array.sortInPlaceBy projection array
         Array.map projection array
     else
-        let projectedFields = Array.Parallel.map projection array
-        let preSortedPartitions = prepareSortedRunsInPlace array projectedFields
+        let projectedFields = Array.zeroCreate array.Length
+        let preSortedPartitions = prepareSortedRunsInPlace array projectedFields projection
 
         mergeRunsInParallel preSortedPartitions (mergeTwoSortedConsequtiveSegmentsInPlaceByKeys projectedFields)
         |> ignore
