@@ -44,33 +44,33 @@ module CustomImpl =
         let partitions = Shared.createPartitions array
         let possiblyOverlappingSegments = Array.zeroCreate partitions.Length
 
-        Parallel.For(0, partitions.Length, fun i ->
+        Parallel.For(0, partitions.Length, fun partitionIdx ->
             let segments = new ResizeArray<_>()
-            let partition = partitions[i]
+            let partition = partitions[partitionIdx]
             let mutable lastKey = projectedFields.[partition.Offset]
             let mutable lastKeyIndex = partition.Offset
-            for i=(partition.Offset+1) to (partition.Offset + partition.Count - 1) do
-                let currentKey = projectedFields.[i]
+            for elementIdx=(partition.Offset+1) to (partition.Offset + partition.Count - 1) do
+                let currentKey = projectedFields.[elementIdx]
                 if currentKey <> lastKey then
-                    segments.Add(lastKey,new ArraySegment<'T>(array,lastKeyIndex, i - lastKeyIndex))
+                    segments.Add(lastKey,new ArraySegment<'T>(array,lastKeyIndex, elementIdx - lastKeyIndex))
                     lastKey <- currentKey
-                    lastKeyIndex <- i  
+                    lastKeyIndex <- elementIdx  
 
-            segments.Add(lastKey,new ArraySegment<'T>(array,lastKeyIndex, array.Length - lastKeyIndex))
-            possiblyOverlappingSegments[i] <- segments
+            segments.Add(lastKey,new ArraySegment<'T>(array,lastKeyIndex, (partition.Offset+partition.Count)-lastKeyIndex))
+            possiblyOverlappingSegments[partitionIdx] <- segments
         ) |> ignore
 
         let allSegments = possiblyOverlappingSegments[0]
         allSegments.EnsureCapacity(possiblyOverlappingSegments |> Array.sumBy (fun ra -> ra.Count)) |> ignore
         for i=1 to (possiblyOverlappingSegments.Length-1) do
             let currentSegment = possiblyOverlappingSegments[i]
-            let (prevLastKey,prevLastSegment) = allSegments[allSegments.Count]
+            let (prevLastKey,prevLastSegment) = allSegments[allSegments.Count-1]
             let (thisFirstKey,thisFirstSegment) = currentSegment[0]
 
             if prevLastKey <> thisFirstKey then
                 allSegments.AddRange(currentSegment)
             else
-                allSegments[allSegments.Count] <- prevLastKey,new ArraySegment<_>(array,prevLastSegment.Offset, prevLastSegment.Count + thisFirstSegment.Count)
+                allSegments[allSegments.Count-1] <- prevLastKey,new ArraySegment<_>(array,prevLastSegment.Offset, prevLastSegment.Count + thisFirstSegment.Count)
                 allSegments.AddRange(currentSegment.Skip(1))
 
         allSegments.ToArray()
@@ -177,7 +177,7 @@ type StructRecord = {Id : int; Value : float}
 [<GenericTypeArguments(typeof<ReferenceRecord>)>]
 [<GenericTypeArguments(typeof<ReferenceRecordManyBuckets>)>]
 [<GenericTypeArguments(typeof<StructRecord>)>]
-//[<ShortRunJob>]//[<DryJob>]  // Uncomment heere for quick local testing
+//[<DryJob>]  // Uncomment heere for quick local testing
 type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() = 
 
     let r = new Random(42)
@@ -193,8 +193,8 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
     [<Benchmark(Baseline = true)>]
     member this.Sequential () = 
-
         this.ArrayWithItems |> SequentialImplementation.groupBy ('T.Projection())
+
     [<Benchmark>]
     member this.PLINQDefault () = 
         this.ArrayWithItems |> PLINQImplementation.groupBy ('T.Projection())
@@ -208,14 +208,13 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.GroupByInPlaceViaSort () = 
         this.ArrayWithItems |> CustomImpl.groupByInPlaceViaSort ('T.Projection())
 
-    [<Benchmark()>]
-    member this.GroupByInPlaceViaSortAndParallelSegmentation () = 
-        this.ArrayWithItems |> CustomImpl.groupByInPlaceViaSortAndParallelSegmentation ('T.Projection())
-
-
     [<Benchmark>]
     member this.EachChunkSeparatelyThenMerge () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
+
+    [<Benchmark()>]
+    member this.GroupByInPlaceViaSortAndParallelSegmentation () = 
+        this.ArrayWithItems |> CustomImpl.groupByInPlaceViaSortAndParallelSegmentation ('T.Projection())
 
 
 
