@@ -75,6 +75,18 @@ let rec mergeRunsInParallel (segmentsInOrder: ArraySegment<'T>[]) pairwiseMerger
 let sortInPlaceBy (projection: 'T -> 'U) (array: 'T[]) =
 
     if array.Length < Shared.sequentialCutoffForGrouping then
+        Array.sortInPlaceBy projection array    
+    else
+        let projectedFields = Array.zeroCreate array.Length
+        let preSortedPartitions = prepareSortedRunsInPlace array projectedFields projection
+
+        mergeRunsInParallel preSortedPartitions (mergeTwoSortedConsequtiveSegmentsInPlaceByKeys projectedFields)
+        |> ignore
+        
+
+let sortInPlaceByAndReturnFields (projection: 'T -> 'U) (array: 'T[]) =
+
+    if array.Length < Shared.sequentialCutoffForGrouping then
         Array.sortInPlaceBy projection array
         Array.map projection array
     else

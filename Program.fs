@@ -25,7 +25,7 @@ module PLINQImplementation =
 module CustomImpl =
 
     let inline groupByInPlaceViaSort ([<InlineIfLambda>]projection) array = 
-        let projectedFields = Sorting.sortInPlaceBy projection array      
+        let projectedFields = Sorting.sortInPlaceByAndReturnFields projection array      
         let segments = new ResizeArray<_>(1024)
         let mutable lastKey = projectedFields.[0]
         let mutable lastKeyIndex = 0
@@ -40,7 +40,7 @@ module CustomImpl =
         segments.ToArray()
 
     let inline groupByInPlaceViaSortAndParallelSegmentation ([<InlineIfLambda>]projection) array = 
-        let projectedFields = Sorting.sortInPlaceBy projection array      
+        let projectedFields = Sorting.sortInPlaceByAndReturnFields projection array      
 
         let partitions = Shared.createPartitions array
         let possiblyOverlappingSegments = Array.zeroCreate partitions.Length
@@ -341,11 +341,17 @@ type IBenchMarkElement<'T when 'T :> IBenchMarkElement<'T>> =
     static abstract Projection: unit -> ('T -> int)
 
 
-type ReferenceRecord = {Id : int; Value : float}
-    with interface IBenchMarkElement<ReferenceRecord> 
+type ReferenceRecordExpensiveProjection = {Id : int; Value : float}
+    with interface IBenchMarkElement<ReferenceRecordExpensiveProjection> 
             with 
                 static member Create(id,value) = {Id = id; Value = value}
                 static member Projection() = fun x -> (x.Id.ToString().GetHashCode() * (x.Value |> sin |> string |> hash)) % 20
+
+type ReferenceRecordNormal = {Id : int; Value : float}
+    with interface IBenchMarkElement<ReferenceRecordNormal> 
+            with 
+                static member Create(id,value) = {Id = id; Value = value}
+                static member Projection() = fun x -> (x.Id  ) % 128
 
 type ReferenceRecordManyBuckets = {Id : int; Value : float}
     with interface IBenchMarkElement<ReferenceRecordManyBuckets> 
@@ -361,10 +367,72 @@ type StructRecord = {Id : int; Value : float}
                 static member Projection() = fun x -> x.Id % 20
 
 
+type ElementType =
+    | StructRecord = 0
+    | ReferenceRecord = 1
+    | ExpensiveProjection = 2
+    | ManyResultingBuckets = 3
+
 [<MemoryDiagnoser>]
 //[<EtwProfiler>]
 [<ThreadingDiagnoser>]
-[<GenericTypeArguments(typeof<ReferenceRecord>)>]
+[<DryJob>]  // Uncomment heere for quick local testing
+type ArrayParallelGroupByBenchMarkAllInOne()   = 
+    let r = new Random(42)
+
+
+    [<Params(ElementType.StructRecord,ElementType.ReferenceRecord,ElementType.ExpensiveProjection,ElementType.ManyResultingBuckets)>]   
+    member val Type = ElementType.StructRecord with get,set
+
+    [<Params(4_000,100_000,2_500_000)>]      
+    member val NumberOfItems = -1 with get,set
+
+    member val ArrayWithItems = Unchecked.defaultof<obj> with get,set
+
+    member this.Create<'T when 'T :> IBenchMarkElement<'T>>() =
+        this.ArrayWithItems <- (Array.init this.NumberOfItems (fun idx -> 'T.Create(idx,r.NextDouble()))) :> obj
+
+    member this.Process<'T when 'T :> IBenchMarkElement<'T>>(func:('T->'a) -> array<'T> -> array<'a * array<'T>>) = 
+        (this.ArrayWithItems :?> array<'T>) |> func ('T.Projection()) |> Array.length
+
+    [<GlobalSetup>]
+    member this.GlobalSetup () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Create<StructRecord>()
+        | ElementType.ReferenceRecord -> this.Create<ReferenceRecordNormal>()
+        | ElementType.ExpensiveProjection -> this.Create<ReferenceRecordExpensiveProjection>()
+        | ElementType.ManyResultingBuckets -> this.Create<ReferenceRecordManyBuckets>()
+
+    [<Benchmark(Baseline=true)>]
+    member this.ArrayGroupBy () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(Array.groupBy)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(Array.groupBy)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(Array.groupBy)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(Array.groupBy)
+
+    [<Benchmark(Baseline=true)>]
+    member this.PLINQDefault () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(PLINQImplementation.groupBy)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(PLINQImplementation.groupBy)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(PLINQImplementation.groupBy)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(PLINQImplementation.groupBy)
+
+    [<Benchmark>]
+    member this.EachChunkSeparatelyThenMerge () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(CustomImpl.eachChunkSeparatelyThenMerge)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(CustomImpl.eachChunkSeparatelyThenMerge)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(CustomImpl.eachChunkSeparatelyThenMerge)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenMerge)
+             
+
+[<MemoryDiagnoser>]
+//[<EtwProfiler>]
+[<ThreadingDiagnoser>]
+[<GenericTypeArguments(typeof<ReferenceRecordExpensiveProjection>)>]
+[<GenericTypeArguments(typeof<ReferenceRecordNormal>)>]
 [<GenericTypeArguments(typeof<ReferenceRecordManyBuckets>)>]
 [<GenericTypeArguments(typeof<StructRecord>)>]
 //[<DryJob>]  // Uncomment heere for quick local testing
@@ -372,7 +440,7 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
     let r = new Random(42)
 
-    [<Params(500,4_000,100_000,2_500_000)>]      
+    [<Params(4_000,100_000,2_500_000)>]      
     member val NumberOfItems = -1 with get,set
 
     member val ArrayWithItems = Unchecked.defaultof<'T[]> with get,set
@@ -381,7 +449,7 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.GlobalSetup () = 
         this.ArrayWithItems <- Array.init this.NumberOfItems (fun idx -> 'T.Create(idx,r.NextDouble()))        
 
-    [<Benchmark(Baseline = true)>]
+    //[<Benchmark(Baseline = true)>]
     member this.Sequential () = 
         this.ArrayWithItems |> SequentialImplementation.groupBy ('T.Projection())
 
@@ -402,15 +470,15 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
     member this.EachChunkSeparatelyThenMerge () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMerge ('T.Projection())
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.DivideSmallConquer () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMergeUsingSmall ('T.Projection())
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.EachChunkSeparatelyThenMergeUsingSort () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMergeUsingSort ('T.Projection())
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.DivideViaSmallRAThenSort () = 
         this.ArrayWithItems |> CustomImpl.eachChunkSeparatelyThenMergeUsingSortAndSmallArray ('T.Projection())
 
@@ -471,5 +539,6 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
 [<EntryPoint>]
 let main argv =
-    BenchmarkSwitcher.FromTypes([|typedefof<ArrayParallelGroupByBenchMark<ReferenceRecord> >|]).Run(argv) |> ignore   
+    BenchmarkRunner.Run<ArrayParallelGroupByBenchMarkAllInOne>() |> ignore    
+    //BenchmarkSwitcher.FromTypes([|typedefof<ArrayParallelGroupByBenchMark<ReferenceRecordNormal> >|]).Run(argv) |> ignore   
     0
