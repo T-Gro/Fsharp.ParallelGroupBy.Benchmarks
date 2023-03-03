@@ -97,73 +97,120 @@ module CustomImpl =
         let g = sortThenCreateGroups projection array
         g |> Array.Parallel.map (fun (key,segment) -> (key,segment.ToArray()))
 
+    type ArrayBuilder<'T when 'T:equality>(singleElemArray) = 
+        let mutable _linkedList : list<'T array> = []
+        let mutable _tail : 'T array = singleElemArray
+        let mutable _tailIdx = 1
+
+        member _.Add(item:'T) = 
+            if _tailIdx = _tail.Length then
+                _linkedList <- _tail :: _linkedList
+                _tail <- Array.zeroCreate (_tail.Length * 4)
+                _tail[0] <- item
+                _tailIdx <- 1
+            else
+                _tail[_tailIdx] <- item
+                _tailIdx <- _tailIdx + 1
+
+        member _.GetAsList() = 
+            Array.Resize(&_tail,_tailIdx)
+            (_tail :: _linkedList)
+
+        member _.CombineWith(other:ArrayBuilder<'T>) =
+            _linkedList <- other.GetAsList() @ _linkedList
+
+        member _.Count() = 
+            _tailIdx + (_linkedList |> List.sumBy (fun x -> x.Length))
+
+        member _.SumBy(func) = 
+            let mutable fromTail = 0
+            for i=0 to (_tailIdx-1) do
+                fromTail <- fromTail + (func _tail[i])          
+            let fromLinkedList = _linkedList |> List.sumBy (fun li -> li |> Array.sumBy func)
+            fromLinkedList + fromTail
+
+        member _.CopyTo(destination:'T [],offset : int) =
+            Array.Copy(_tail, 0, destination, offset, _tailIdx)
+
+            let mutable destinationOffset = offset + _tailIdx
+            _linkedList |> List.iter (fun arr ->
+                Array.Copy(arr,0, destination, destinationOffset, arr.Length)           
+                destinationOffset <- destinationOffset + arr.Length)
+
+            destinationOffset
+
+        member this.ToArray() =
+            let arr = Array.zeroCreate (this.Count())
+            this.CopyTo(arr,0) |> ignore
+            arr
+
+        member _.Iter(action) = 
+            for i=0 to (_tailIdx-1) do
+                action _tail[i]
+            _linkedList |> List.iter (fun li -> li |> Array.iter action)
+            
+
     [<Struct>]
-    type SmallResizeArray<'T> =
-        | Single of onlyOne:'T
-        | Double of first:'T * second:'T
-        | ThreeOrMore of collection:ResizeArray<'T>
+    type SmallResizeArray<'T when 'T:equality> =
+        | Single of onlyOne:'T    
+        | TwoOrMore of collection:ArrayBuilder<'T>
 
         with 
             member this.Count = 
                 match this with
-                | Single _ -> 1
-                | Double _ -> 2
-                | ThreeOrMore col -> col.Count
+                | Single _ -> 1            
+                | TwoOrMore col -> col.Count()
+            member this.SumBy(func) = 
+                match this with
+                | Single x -> func x           
+                | TwoOrMore col -> col.SumBy(func)
             member this.CopyTo(target:'T array, idx:int) =
                 match this with
-                | Single x -> target[idx] <- x
-                | Double (f,s) -> 
-                    target[idx] <- f
-                    target[idx+1] <- s
-                | ThreeOrMore col -> col.CopyTo(target,idx)
+                | Single x -> 
+                    target[idx] <- x             
+                    idx + 1
+                | TwoOrMore col -> col.CopyTo(target,idx)
             member this.Add(item:'T) =
                 match this with
-                | Single x -> Double(x,item)
-                | Double (f,s) -> 
-                    let nra = new ResizeArray<_>()
-                    nra.Add(f)
-                    nra.Add(s)
-                    nra.Add(item)
-                    ThreeOrMore(nra)
-                | ThreeOrMore col -> 
+                | Single x -> TwoOrMore(new ArrayBuilder<_>([|x;item|]))               
+                | TwoOrMore col -> 
                     col.Add(item)
                     this
 
 
-    let createPerChunkResults projection array = 
+    let inline createPerChunkResults ([<InlineIfLambda>]projection) array = 
         let partitions = Shared.createPartitions array
         let resultsPerChunk = Array.zeroCreate partitions.Length
         // O (N / threads)      
         Parallel.For(0,partitions.Length, fun i ->            
             let chunk = partitions[i]
-            let localDict = new Dictionary<_,ResizeArray<_>>(partitions.Length)
-            resultsPerChunk[i] <- localDict
+            let localDict = new Dictionary<_,ArrayBuilder<_>>(chunk.Count)
+            
             let lastOffset = chunk.Offset + chunk.Count - 1 
             for i=chunk.Offset to lastOffset do
                 let x = array.[i]
                 let key = projection x
                 match localDict.TryGetValue(key) with
                 | true, bucket -> bucket.Add(x)
-                | false, _ -> 
-                    let newList = new ResizeArray<_>(1)  
-                    newList.Add(x)
-                    localDict.Add(key,newList)) |> ignore   
+                | false, _ -> localDict.Add(key,new ArrayBuilder<_>(Array.singleton x))
+            resultsPerChunk[i] <- localDict.ToArray()
+            resultsPerChunk[i] |> Array.sortInPlaceBy (fun kvp -> kvp.Key)) |> ignore   
 
         resultsPerChunk
 
-    let inline createPerChunkResultsUsingSmallResizeArray projection array = 
+    let inline createPerChunkResultsUsingSmallResizeArray ([<InlineIfLambda>]projection) array = 
         let partitions = Shared.createPartitions array
         let resultsPerChunk = Array.zeroCreate partitions.Length
         // O (N / threads)      
         Parallel.For(0,partitions.Length, fun i ->            
             let chunk = partitions[i]
-            let localDict = new Dictionary<_,SmallResizeArray<_>>(partitions.Length)            
+            let localDict = new Dictionary<_,SmallResizeArray<_>>(chunk.Count)            
             let lastOffset = chunk.Offset + chunk.Count - 1 
             for i=chunk.Offset to lastOffset do
                 let x = array.[i]
                 let key = projection x
                 match localDict.TryGetValue(key) with
-                | true, ThreeOrMore col -> col.Add(x)
+                | true, TwoOrMore col -> col.Add(x)
                 | true, oneOrTwo -> localDict[key] <- oneOrTwo.Add(x)
                 | false, _ -> localDict.Add(key,Single(x))  
 
@@ -171,9 +218,74 @@ module CustomImpl =
 
         resultsPerChunk
 
-    let inline combineChunksFromThreads (resultsPerChunk:Dictionary<_,ResizeArray<_>> array) : Dictionary<_,ResizeArray<ResizeArray<_>>> =
+    let combineFromThreadsViaSort  (resultsPerChunk:array<KeyValuePair<_,ArrayBuilder<_>>> array) =
+
+        let mergeTogether          
+            (left: array<KeyValuePair<_,ArrayBuilder<_>>>)
+            (right: array<KeyValuePair<_,ArrayBuilder<_>>>)
+            =
+
+            let mutable resultArray = Array.zeroCreate (left.Length + right.Length)
+            let mutable resultPointer = 0
+            let mutable leftPointer = 0
+            let mutable rightPointer = 0
+
+            while (leftPointer < left.Length && rightPointer < right.Length) do
+                match compare (left[leftPointer].Key) (right[rightPointer].Key) with
+                | 0 -> 
+                    let kvp = left[leftPointer]
+                    kvp.Value.CombineWith(right[rightPointer].Value)
+                    resultArray[resultPointer] <- kvp
+                    leftPointer <- leftPointer + 1
+                    rightPointer <- rightPointer + 1
+                | neg when neg < 0 ->
+                    resultArray[resultPointer] <- left[leftPointer]
+                    leftPointer <- leftPointer + 1
+                | positive -> 
+                    resultArray[resultPointer] <- right[rightPointer]
+                    rightPointer <- rightPointer + 1
+
+                resultPointer <- resultPointer + 1
+
+            while(leftPointer < left.Length) do
+                resultArray[resultPointer] <- left[leftPointer]
+                resultPointer <- resultPointer + 1
+                leftPointer <- leftPointer + 1
+
+            while(rightPointer < right.Length) do
+                resultArray[resultPointer] <- right[rightPointer]
+                resultPointer <- resultPointer + 1
+                rightPointer <- rightPointer + 1
+
+
+            Array.Resize(&resultArray, resultPointer)
+            resultArray
+
+        let rec mergeRunsInParallel (resultsPerChunk:array<KeyValuePair<_,ArrayBuilder<_>>> array) =
+            match resultsPerChunk with
+            | [| singleRun |] -> singleRun
+            | [| first; second |] -> mergeTogether first second
+            | [||] -> invalidArg "runs" LanguagePrimitives.ErrorStrings.InputArrayEmptyString
+            | threeOrMoreSegments ->
+                let mutable left = None
+                let mutable right = None
+                let midIndex = threeOrMoreSegments.Length / 2
+
+                Parallel.Invoke(
+                    (fun () -> left <- Some(mergeRunsInParallel threeOrMoreSegments[0 .. midIndex - 1] )),
+                    (fun () -> right <- Some(mergeRunsInParallel threeOrMoreSegments[midIndex..] ))
+                )
+
+                mergeTogether left.Value right.Value
+
+        resultsPerChunk
+        |> mergeRunsInParallel
+        |> Array.Parallel.map (fun x -> (x.Key, x.Value.ToArray()))
+
+
+    let combineChunksFromThreads (resultsPerChunk:array<KeyValuePair<_,ArrayBuilder<_>>> array) : Dictionary<_,ResizeArray<ArrayBuilder<_>>> =
         // O ( threads * groups)
-        let allResults = new Dictionary<_,ResizeArray<ResizeArray<_>>>()  // one entry per final key
+        let allResults = new Dictionary<_,ResizeArray<ArrayBuilder<_>>>(resultsPerChunk[0].Length)  // one entry per final key
         for i=0 to resultsPerChunk.Length-1 do
             let result = resultsPerChunk.[i]
             for kvp in result do
@@ -185,20 +297,20 @@ module CustomImpl =
                     allResults.Add(kvp.Key,newBuck)
         allResults
 
-    let inline combineChunksFromThreadsUsingSmall (resultsPerChunk:array<KeyValuePair<_,SmallResizeArray<_>>> array) : Dictionary<_,SmallResizeArray<SmallResizeArray<_>>> =
+    let combineChunksFromThreadsUsingSmall (resultsPerChunk:array<KeyValuePair<_,SmallResizeArray<_>>> array) : Dictionary<_,SmallResizeArray<SmallResizeArray<_>>> =
         // O ( threads * groups)
-        let allResults = new Dictionary<_,SmallResizeArray<SmallResizeArray<_>>>()  // one entry per final key
+        let allResults = new Dictionary<_,SmallResizeArray<SmallResizeArray<_>>>(resultsPerChunk[0].Length)  // one entry per final key
         for i=0 to resultsPerChunk.Length-1 do
             let result = resultsPerChunk.[i]
             for kvp in result do
                 match allResults.TryGetValue(kvp.Key) with
-                | true, ThreeOrMore col -> col.Add(kvp.Value)
-                | true, oneOrTwo -> allResults[kvp.Key] <- oneOrTwo.Add(kvp.Value)
+                | true, TwoOrMore col -> col.Add(kvp.Value)
+                | true, one -> allResults[kvp.Key] <- one.Add(kvp.Value)
                 | false, _ -> allResults.Add(kvp.Key, Single kvp.Value)  
 
         allResults
 
-    let inline combineChunksFromThreadsViaSort (resultsPerChunk:Dictionary<'TKey,ResizeArray<'TVal>> array) : (('TKey * 'TVal array)array) =
+    let combineChunksFromThreadsViaSort (resultsPerChunk:Dictionary<'TKey,ArrayBuilder<'TVal>> array) : (('TKey * 'TVal array)array) =
         // O ( threads * groups)
 
         let flattened = resultsPerChunk |> Array.collect (fun d -> d.ToArray())
@@ -209,14 +321,13 @@ module CustomImpl =
         let addSegment key firstOffset lastOffset = 
             let mutable count = 0
             for i=firstOffset to lastOffset do
-                count <- count + flattened[i].Value.Count
+                count <- count + flattened[i].Value.Count()
 
             let finalArrayForThisKey = Array.zeroCreate count
             let mutable finalArrayOffset = 0
             for i=firstOffset to lastOffset do
                 let currentList = flattened[i].Value
-                currentList.CopyTo(finalArrayForThisKey,finalArrayOffset)
-                finalArrayOffset <- finalArrayOffset + currentList.Count
+                finalArrayOffset <- currentList.CopyTo(finalArrayForThisKey,finalArrayOffset)
 
             segments.Add(key,finalArrayForThisKey)
 
@@ -234,7 +345,7 @@ module CustomImpl =
         
         segments.ToArray()
 
-    let inline combineChunksFromThreadsViaSortAndSmallResizeArray (resultsPerChunk:array<KeyValuePair<'TKey,SmallResizeArray<'TVal>>> array) : (('TKey * 'TVal array)array) =
+    let combineChunksFromThreadsViaSortAndSmallResizeArray (resultsPerChunk:array<KeyValuePair<'TKey,SmallResizeArray<'TVal>>> array) : (('TKey * 'TVal array)array) =
         // O ( threads * groups)
 
         let flattened = resultsPerChunk |> Array.collect id
@@ -250,9 +361,8 @@ module CustomImpl =
             let finalArrayForThisKey = Array.zeroCreate count
             let mutable finalArrayOffset = 0
             for i=firstOffset to lastOffset do
-                let currentList = flattened[i].Value
-                currentList.CopyTo(finalArrayForThisKey,finalArrayOffset)
-                finalArrayOffset <- finalArrayOffset + currentList.Count
+                let currentList = flattened[i].Value                
+                finalArrayOffset <- currentList.CopyTo(finalArrayForThisKey,finalArrayOffset)
 
             segments.Add(key,finalArrayForThisKey)
 
@@ -270,44 +380,34 @@ module CustomImpl =
         
         segments.ToArray()
 
-    let inline createFinalArrays (allResults:Dictionary<_,ResizeArray<ResizeArray<_>>>) = 
+    let createFinalArrays (allResults:Dictionary<_,ResizeArray<ArrayBuilder<_>>>) = 
         let results = Array.zeroCreate allResults.Count   
         let nonFlattenResults = allResults.ToArray()
 
         Parallel.For(0,nonFlattenResults.Length, fun i ->            
             let kvp = nonFlattenResults.[i] 
-            let finalArrayForKey = Array.zeroCreate (kvp.Value |> Seq.sumBy (fun x -> x.Count))
+            let finalArrayForKey = Array.zeroCreate (kvp.Value |> Seq.sumBy (fun x -> x.Count()))
             let mutable finalArrayOffset = 0
             for bucket in kvp.Value do
-                bucket.CopyTo(finalArrayForKey,finalArrayOffset)
-                finalArrayOffset <- finalArrayOffset + bucket.Count
-           
+                finalArrayOffset <- bucket.CopyTo(finalArrayForKey,finalArrayOffset)   
+
             results.[i] <- (kvp.Key,finalArrayForKey)
         ) |> ignore    
         results
 
-    let inline createFinalArraysFromSmall (allResults:Dictionary<_,SmallResizeArray<SmallResizeArray<_>>>) = 
+    let createFinalArraysFromSmall (allResults:Dictionary<_,SmallResizeArray<SmallResizeArray<_>>>) = 
         let results = Array.zeroCreate allResults.Count   
         let nonFlattenResults = allResults.ToArray()
 
         Parallel.For(0,nonFlattenResults.Length, fun i ->            
             let kvp = nonFlattenResults.[i] 
-            let finalArrayForKey = Array.zeroCreate (match kvp.Value with | Single x -> x.Count | Double (f,s) -> f.Count + s.Count | ThreeOrMore col -> col |> Seq.sumBy (fun c -> c.Count))
+            let finalArrayForKey = Array.zeroCreate (kvp.Value.SumBy (fun x -> x.Count))
             let mutable finalArrayOffset = 0
             match kvp.Value with
             | Single x ->  
-                x.CopyTo(finalArrayForKey, finalArrayOffset)
-                finalArrayOffset <- finalArrayOffset + x.Count
-            | Double (f,s) -> 
-                f.CopyTo(finalArrayForKey, finalArrayOffset)
-                finalArrayOffset <- finalArrayOffset + f.Count
-                s.CopyTo(finalArrayForKey, finalArrayOffset)
-                finalArrayOffset <- finalArrayOffset + s.Count
-            | ThreeOrMore col ->
-                for colIdx=0 to (col.Count-1) do
-                    let bucket = col[colIdx]
-                    bucket.CopyTo(finalArrayForKey,finalArrayOffset)
-                    finalArrayOffset <- finalArrayOffset + bucket.Count
+                finalArrayOffset <- x.CopyTo(finalArrayForKey, finalArrayOffset)        
+            | TwoOrMore col ->
+                col.Iter( fun bucket -> finalArrayOffset <- bucket.CopyTo(finalArrayForKey,finalArrayOffset))
            
             results.[i] <- (kvp.Key,finalArrayForKey)
         ) |> ignore    
@@ -329,7 +429,7 @@ module CustomImpl =
     let inline eachChunkSeparatelyThenMergeUsingSort projection array =    
         array
         |> createPerChunkResults projection   // O (N / threads)  
-        |> combineChunksFromThreadsViaSort           // O ( threads * groups)   
+        |> combineFromThreadsViaSort           // O ( threads * groups)   
         
     let inline eachChunkSeparatelyThenMergeUsingSortAndSmallArray projection array =    
         array
@@ -376,7 +476,8 @@ type ElementType =
 [<MemoryDiagnoser>]
 //[<EtwProfiler>]
 [<ThreadingDiagnoser>]
-[<DryJob>]  // Uncomment heere for quick local testing
+[<ShortRunJob>]
+//[<DryJob>]  // Uncomment heere for quick local testing
 type ArrayParallelGroupByBenchMarkAllInOne()   = 
     let r = new Random(42)
 
@@ -395,6 +496,9 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
     member this.Process<'T when 'T :> IBenchMarkElement<'T>>(func:('T->'a) -> array<'T> -> array<'a * array<'T>>) = 
         (this.ArrayWithItems :?> array<'T>) |> func ('T.Projection()) |> Array.length
 
+    member this.ProcessWithSegments<'T when 'T :> IBenchMarkElement<'T>>(func:('T->'a) -> array<'T> -> array<'a * ArraySegment<'T>>) = 
+        (this.ArrayWithItems :?> array<'T>) |> func ('T.Projection()) |> Array.length
+
     [<GlobalSetup>]
     member this.GlobalSetup () = 
         match this.Type with
@@ -403,7 +507,7 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.ExpensiveProjection -> this.Create<ReferenceRecordExpensiveProjection>()
         | ElementType.ManyResultingBuckets -> this.Create<ReferenceRecordManyBuckets>()
 
-    [<Benchmark(Baseline=true)>]
+    //[<Benchmark()>]
     member this.ArrayGroupBy () = 
         match this.Type with
         | ElementType.StructRecord -> this.Process<StructRecord>(Array.groupBy)
@@ -426,8 +530,40 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(CustomImpl.eachChunkSeparatelyThenMerge)
         | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(CustomImpl.eachChunkSeparatelyThenMerge)
         | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenMerge)
-             
 
+    [<Benchmark>]
+    member this.EachChunkSeparatelyThenMergeUsingSort () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
+
+    //[<Benchmark>]
+    member this.GroupByInPlaceViaSortAndParallelSegmentation () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.ProcessWithSegments<StructRecord>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
+        | ElementType.ReferenceRecord -> this.ProcessWithSegments<ReferenceRecordNormal>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
+        | ElementType.ExpensiveProjection -> this.ProcessWithSegments<ReferenceRecordExpensiveProjection>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
+        | ElementType.ManyResultingBuckets -> this.ProcessWithSegments<ReferenceRecordManyBuckets>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
+             
+    //[<Benchmark>]
+    member this.SortThenCreateGroups () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.ProcessWithSegments<StructRecord>(CustomImpl.sortThenCreateGroups)
+        | ElementType.ReferenceRecord -> this.ProcessWithSegments<ReferenceRecordNormal>(CustomImpl.sortThenCreateGroups)
+        | ElementType.ExpensiveProjection -> this.ProcessWithSegments<ReferenceRecordExpensiveProjection>(CustomImpl.sortThenCreateGroups)
+        | ElementType.ManyResultingBuckets -> this.ProcessWithSegments<ReferenceRecordManyBuckets>(CustomImpl.sortThenCreateGroups)
+
+    //[<Benchmark>]
+    member this.GroupByInPlaceViaSort () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.ProcessWithSegments<StructRecord>(CustomImpl.groupByInPlaceViaSort)
+        | ElementType.ReferenceRecord -> this.ProcessWithSegments<ReferenceRecordNormal>(CustomImpl.groupByInPlaceViaSort)
+        | ElementType.ExpensiveProjection -> this.ProcessWithSegments<ReferenceRecordExpensiveProjection>(CustomImpl.groupByInPlaceViaSort)
+        | ElementType.ManyResultingBuckets -> this.ProcessWithSegments<ReferenceRecordManyBuckets>(CustomImpl.groupByInPlaceViaSort)
+
+#if Hide_These_Guys
 [<MemoryDiagnoser>]
 //[<EtwProfiler>]
 [<ThreadingDiagnoser>]
@@ -488,15 +624,6 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
 
 
-
-
-
-
-
-#if Hide_These_Guys
-
-
-
     //[<Benchmark>]
     member this.PlinqSortForReference () = 
         this.ArrayWithItems |> PLINQImplementation.sortBy ('T.Projection())
@@ -537,8 +664,16 @@ type ArrayParallelGroupByBenchMark<'T when 'T :> IBenchMarkElement<'T>>() =
 
 #endif
 
+let debugIssues() = 
+    let bm = new ArrayParallelGroupByBenchMarkAllInOne()
+    bm.NumberOfItems <- 4000
+    bm.Type <- ElementType.StructRecord
+    bm.GlobalSetup()
+    bm.EachChunkSeparatelyThenMergeUsingSort()
+
 [<EntryPoint>]
-let main argv =
+let main argv = 
+
     BenchmarkRunner.Run<ArrayParallelGroupByBenchMarkAllInOne>() |> ignore    
     //BenchmarkSwitcher.FromTypes([|typedefof<ArrayParallelGroupByBenchMark<ReferenceRecordNormal> >|]).Run(argv) |> ignore   
     0
