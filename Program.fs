@@ -178,7 +178,7 @@ module CustomImpl =
                     this
 
 
-    let inline createPerChunkResults ([<InlineIfLambda>]projection) array = 
+    let inline createPerChunkResults shouldSort ([<InlineIfLambda>]projection) array = 
         let partitions = Shared.createPartitions array
         let resultsPerChunk = Array.zeroCreate partitions.Length
         // O (N / threads)      
@@ -194,7 +194,8 @@ module CustomImpl =
                 | true, bucket -> bucket.Add(x)
                 | false, _ -> localDict.Add(key,new ArrayBuilder<_>(Array.singleton x))
             resultsPerChunk[i] <- localDict.ToArray()
-            resultsPerChunk[i] |> Array.sortInPlaceBy (fun kvp -> kvp.Key)) |> ignore   
+            if shouldSort then
+                resultsPerChunk[i] |> Array.sortInPlaceBy (fun kvp -> kvp.Key)) |> ignore   
 
         resultsPerChunk
 
@@ -292,10 +293,29 @@ module CustomImpl =
                 match allResults.TryGetValue(kvp.Key) with
                 | true, bucket -> bucket.Add(kvp.Value)
                 | false, _ -> 
-                    let newBuck = new ResizeArray<_>(resultsPerChunk.Length) // MAX. one per partition, in theory less
+                    let newBuck = new ResizeArray<_>(resultsPerChunk.Length-i) // MAX. one per partition, in theory less
                     newBuck.Add(kvp.Value)
                     allResults.Add(kvp.Key,newBuck)
         allResults
+
+    let combineArrayBuildersFromThreads (resultsPerChunk:array<KeyValuePair<_,ArrayBuilder<_>>> array) : Dictionary<_,ArrayBuilder<_>> =
+        // O ( threads * groups)
+        let allResults = new Dictionary<_,ArrayBuilder<_>>(resultsPerChunk[0].Length)  // one entry per final key
+        for i=0 to resultsPerChunk.Length-1 do
+            let result = resultsPerChunk.[i]
+            for kvp in result do
+                match allResults.TryGetValue(kvp.Key) with
+                | true, bucket -> bucket.CombineWith(kvp.Value)
+                | false, _ -> allResults.Add(kvp.Key,kvp.Value)
+        allResults
+    
+    let buildersToArray (d:Dictionary<_,ArrayBuilder<_>>) = 
+        let arr = Array.zeroCreate d.Count
+        let mutable idx = 0
+        for kvp in d do
+            arr[idx] <- (kvp.Key, kvp.Value.ToArray())
+            idx <- idx + 1
+        arr    
 
     let combineChunksFromThreadsUsingSmall (resultsPerChunk:array<KeyValuePair<_,SmallResizeArray<_>>> array) : Dictionary<_,SmallResizeArray<SmallResizeArray<_>>> =
         // O ( threads * groups)
@@ -416,9 +436,15 @@ module CustomImpl =
 
     let inline eachChunkSeparatelyThenMerge projection array =    
         array
-        |> createPerChunkResults projection   // O (N / threads)  
+        |> createPerChunkResults false projection   // O (N / threads)  
         |> combineChunksFromThreads           // O ( threads * groups)
         |> createFinalArrays                  // O(N)
+
+    let inline eachChunkSeparatelyThenCombineArrayBuilders  projection array =
+        array
+        |> createPerChunkResults false projection
+        |> combineArrayBuildersFromThreads
+        |> buildersToArray
 
     let inline eachChunkSeparatelyThenMergeUsingSmall projection array =    
         array
@@ -428,7 +454,7 @@ module CustomImpl =
       
     let inline eachChunkSeparatelyThenMergeUsingSort projection array =    
         array
-        |> createPerChunkResults projection   // O (N / threads)  
+        |> createPerChunkResults true projection   // O (N / threads)  
         |> combineFromThreadsViaSort           // O ( threads * groups)   
         
     let inline eachChunkSeparatelyThenMergeUsingSortAndSmallArray projection array =    
@@ -466,26 +492,34 @@ type StructRecord = {Id : int; Value : float}
                 static member Create(id,value) = {Id = id; Value = value}
                 static member Projection() = fun x -> x.Id % 20
 
+[<Struct>]
+type StructRecordManyBuckets = {Id : int; Value : float}
+    with interface IBenchMarkElement<StructRecordManyBuckets> 
+            with 
+                static member Create(id,value) = {Id = id; Value = value}
+                static member Projection() = fun x -> x.Id % 10_000
+
 
 type ElementType =
     | StructRecord = 0
     | ReferenceRecord = 1
     | ExpensiveProjection = 2
     | ManyResultingBuckets = 3
+    | StructRecordManyBuckets = 4
 
 [<MemoryDiagnoser>]
 //[<EtwProfiler>]
 [<ThreadingDiagnoser>]
-[<ShortRunJob>]
+//[<ShortRunJob>]
 //[<DryJob>]  // Uncomment heere for quick local testing
 type ArrayParallelGroupByBenchMarkAllInOne()   = 
     let r = new Random(42)
 
 
-    [<Params(ElementType.StructRecord,ElementType.ReferenceRecord,ElementType.ExpensiveProjection,ElementType.ManyResultingBuckets)>]   
+    [<Params(ElementType.StructRecord,ElementType.ReferenceRecord,ElementType.ExpensiveProjection,ElementType.ManyResultingBuckets, ElementType.StructRecordManyBuckets)>]   
     member val Type = ElementType.StructRecord with get,set
 
-    [<Params(4_000,100_000,2_500_000)>]      
+    [<Params(4_000,50_000,100_000,500_000,2_500_000, 25_000_000)>]      
     member val NumberOfItems = -1 with get,set
 
     member val ArrayWithItems = Unchecked.defaultof<obj> with get,set
@@ -506,14 +540,25 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.ReferenceRecord -> this.Create<ReferenceRecordNormal>()
         | ElementType.ExpensiveProjection -> this.Create<ReferenceRecordExpensiveProjection>()
         | ElementType.ManyResultingBuckets -> this.Create<ReferenceRecordManyBuckets>()
+        | ElementType.StructRecordManyBuckets -> this.Create<StructRecordManyBuckets>()
 
-    //[<Benchmark()>]
+    [<Benchmark()>]
+    member this.SortByForReference () = 
+        match this.Type with
+        | ElementType.StructRecord -> (this.ArrayWithItems :?> StructRecord[]) |> Array.sortBy (fun x -> x.Value) |> Array.length
+        | ElementType.ReferenceRecord -> (this.ArrayWithItems :?> ReferenceRecordNormal[]) |> Array.sortBy (fun x -> x.Value) |> Array.length
+        | ElementType.ExpensiveProjection -> (this.ArrayWithItems :?> ReferenceRecordExpensiveProjection[]) |> Array.sortBy (fun x -> x.Value) |> Array.length
+        | ElementType.ManyResultingBuckets -> (this.ArrayWithItems :?> ReferenceRecordManyBuckets[]) |> Array.sortBy (fun x -> x.Value) |> Array.length
+        | ElementType.StructRecordManyBuckets -> (this.ArrayWithItems :?> StructRecordManyBuckets[]) |> Array.sortBy (fun x -> x.Value) |> Array.length
+
+    [<Benchmark()>]
     member this.ArrayGroupBy () = 
         match this.Type with
         | ElementType.StructRecord -> this.Process<StructRecord>(Array.groupBy)
         | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(Array.groupBy)
         | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(Array.groupBy)
         | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(Array.groupBy)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(Array.groupBy)
 
     [<Benchmark(Baseline=true)>]
     member this.PLINQDefault () = 
@@ -522,6 +567,7 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(PLINQImplementation.groupBy)
         | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(PLINQImplementation.groupBy)
         | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(PLINQImplementation.groupBy)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(PLINQImplementation.groupBy)
 
     [<Benchmark>]
     member this.EachChunkSeparatelyThenMerge () = 
@@ -530,38 +576,70 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(CustomImpl.eachChunkSeparatelyThenMerge)
         | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(CustomImpl.eachChunkSeparatelyThenMerge)
         | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenMerge)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenMerge)
 
     [<Benchmark>]
-    member this.EachChunkSeparatelyThenMergeUsingSort () = 
+    member this.EachChunkSeparatelyThenCombineArrayBuilders () = 
         match this.Type with
-        | ElementType.StructRecord -> this.Process<StructRecord>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
-        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
-        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
-        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenMergeUsingSort)
+        | ElementType.StructRecord -> this.Process<StructRecord>(CustomImpl.eachChunkSeparatelyThenCombineArrayBuilders)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(CustomImpl.eachChunkSeparatelyThenCombineArrayBuilders)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(CustomImpl.eachChunkSeparatelyThenCombineArrayBuilders)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenCombineArrayBuilders)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(CustomImpl.eachChunkSeparatelyThenCombineArrayBuilders)
 
-    //[<Benchmark>]
+    [<Benchmark>]
     member this.GroupByInPlaceViaSortAndParallelSegmentation () = 
         match this.Type with
         | ElementType.StructRecord -> this.ProcessWithSegments<StructRecord>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
         | ElementType.ReferenceRecord -> this.ProcessWithSegments<ReferenceRecordNormal>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
         | ElementType.ExpensiveProjection -> this.ProcessWithSegments<ReferenceRecordExpensiveProjection>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
         | ElementType.ManyResultingBuckets -> this.ProcessWithSegments<ReferenceRecordManyBuckets>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
+        | ElementType.StructRecordManyBuckets -> this.ProcessWithSegments<StructRecordManyBuckets>(CustomImpl.groupByInPlaceViaSortAndParallelSegmentation)
              
-    //[<Benchmark>]
+    [<Benchmark>]
     member this.SortThenCreateGroups () = 
         match this.Type with
         | ElementType.StructRecord -> this.ProcessWithSegments<StructRecord>(CustomImpl.sortThenCreateGroups)
         | ElementType.ReferenceRecord -> this.ProcessWithSegments<ReferenceRecordNormal>(CustomImpl.sortThenCreateGroups)
         | ElementType.ExpensiveProjection -> this.ProcessWithSegments<ReferenceRecordExpensiveProjection>(CustomImpl.sortThenCreateGroups)
         | ElementType.ManyResultingBuckets -> this.ProcessWithSegments<ReferenceRecordManyBuckets>(CustomImpl.sortThenCreateGroups)
+        | ElementType.StructRecordManyBuckets -> this.ProcessWithSegments<StructRecordManyBuckets>(CustomImpl.sortThenCreateGroups)
 
-    //[<Benchmark>]
+    [<Benchmark>]
     member this.GroupByInPlaceViaSort () = 
         match this.Type with
         | ElementType.StructRecord -> this.ProcessWithSegments<StructRecord>(CustomImpl.groupByInPlaceViaSort)
         | ElementType.ReferenceRecord -> this.ProcessWithSegments<ReferenceRecordNormal>(CustomImpl.groupByInPlaceViaSort)
         | ElementType.ExpensiveProjection -> this.ProcessWithSegments<ReferenceRecordExpensiveProjection>(CustomImpl.groupByInPlaceViaSort)
         | ElementType.ManyResultingBuckets -> this.ProcessWithSegments<ReferenceRecordManyBuckets>(CustomImpl.groupByInPlaceViaSort)
+        | ElementType.StructRecordManyBuckets -> this.ProcessWithSegments<StructRecordManyBuckets>(CustomImpl.groupByInPlaceViaSort)
+
+    [<Benchmark>]
+    member this.FullyOnParallelFor () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(JunkyardOfBadIdeas.fullyOnParallelFor)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(JunkyardOfBadIdeas.fullyOnParallelFor)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(JunkyardOfBadIdeas.fullyOnParallelFor)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(JunkyardOfBadIdeas.fullyOnParallelFor)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(JunkyardOfBadIdeas.fullyOnParallelFor)
+
+    [<Benchmark>]
+    member this.CountByThenAssign () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(JunkyardOfBadIdeas.countByThenAssign)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(JunkyardOfBadIdeas.countByThenAssign)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(JunkyardOfBadIdeas.countByThenAssign)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(JunkyardOfBadIdeas.countByThenAssign)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(JunkyardOfBadIdeas.countByThenAssign)
+
+    [<Benchmark>]
+    member this.ConcurrentMultiDictionairy () = 
+        match this.Type with
+        | ElementType.StructRecord -> this.Process<StructRecord>(JunkyardOfBadIdeas.concurrentMultiDictionairy)
+        | ElementType.ReferenceRecord -> this.Process<ReferenceRecordNormal>(JunkyardOfBadIdeas.concurrentMultiDictionairy)
+        | ElementType.ExpensiveProjection -> this.Process<ReferenceRecordExpensiveProjection>(JunkyardOfBadIdeas.concurrentMultiDictionairy)
+        | ElementType.ManyResultingBuckets -> this.Process<ReferenceRecordManyBuckets>(JunkyardOfBadIdeas.concurrentMultiDictionairy)
+        | ElementType.StructRecordManyBuckets -> this.Process<StructRecordManyBuckets>(JunkyardOfBadIdeas.concurrentMultiDictionairy)
 
 #if Hide_These_Guys
 [<MemoryDiagnoser>]
@@ -669,7 +747,7 @@ let debugIssues() =
     bm.NumberOfItems <- 4000
     bm.Type <- ElementType.StructRecord
     bm.GlobalSetup()
-    bm.EachChunkSeparatelyThenMergeUsingSort()
+    bm.EachChunkSeparatelyThenCombineArrayBuilders()
 
 [<EntryPoint>]
 let main argv = 
