@@ -40,6 +40,35 @@ let countByThenAssign projection array =
         )
     finalResults
 
+let countByThenAssignHandRolled projection array =       
+    let counts = new ConcurrentDictionary<_,_>(concurrencyLevel = Environment.ProcessorCount, capacity = min (array |> Array.length) 1_000)
+    let valueFactory = new Func<_,_>(fun _ -> ref 0)
+
+    let projectedValues = Array.zeroCreate (array |> Array.length)
+    let chunks = Shared.createPartitions array
+
+    Parallel.For(0, chunks.Length, fun chunkIdx -> 
+        let chunk = chunks[chunkIdx]
+        for elemIdx=chunk.Offset to (chunk.Offset+chunk.Count-1) do
+            let projected = projection array[elemIdx]
+            projectedValues[elemIdx] <- projected
+            let counter = counts.GetOrAdd(projected,valueFactory=valueFactory)
+            System.Threading.Interlocked.Increment(counter) |> ignore
+        ) |> ignore
+ 
+    let finalResults = counts.ToArray() |> Array.Parallel.map (fun kvp -> (kvp.Key,Array.zeroCreate kvp.Value.Value))
+    let finalresultsLookup = finalResults |> dict
+    Parallel.For(0, chunks.Length, fun chunkIdx -> 
+        let chunk = chunks[chunkIdx]
+        for elemIdx=chunk.Offset to (chunk.Offset+chunk.Count-1) do
+            let key = projectedValues[elemIdx]
+            let correctBucket = finalresultsLookup[key]
+            let idxToWrite = System.Threading.Interlocked.Decrement(counts[key])
+            correctBucket.[idxToWrite] <- array[elemIdx]
+    ) |> ignore
+
+    finalResults
+
 
 let fullyOnParallelFor projection array =
     let resultsBag = new ConcurrentBag<_>()
