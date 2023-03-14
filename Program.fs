@@ -506,7 +506,7 @@ type ProjectionType = Cheap = 0 | Expensive = 1
 //[<ConcurrencyVisualizerProfiler>]
 //[<EtwProfiler>]
 //[<ShortRunJob>]
-[<DryJob>]  // Uncomment heere for quick local testing
+//[<DryJob>]  // Uncomment heere for quick local testing
 type ArrayParallelGroupByBenchMarkAllInOne()   = 
     let r = new Random(42)
 
@@ -518,10 +518,11 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
     member val ProjType = ProjectionType.Cheap with get,set
 
     //[<Params(4_000,50_000,100_000,500_000,2_500_000, 25_000_000)>] 
-    [<Params(2_500_000, Priority = 0)>] 
+    //[<Params(2_500_000, Priority = 0)>] 
+    [<Params(70,250,1_000,4_000,16_000,64_000,256_000,1_000_000, Priority = 0)>] 
     member val NumberOfItems = -1 with get,set
 
-    [<Params(20,40,8_000,160_000, Priority = 2)>] 
+    [<Params(20,40,800,100_000, Priority = 2)>] 
     member val BucketCount = -1 with get,set
 
     member val ArrayWithItems = Unchecked.defaultof<obj> with get,set
@@ -555,19 +556,19 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.StructRecord -> this.Process<StructRecord>(Array.groupBy)
         | ElementType.RefRecord -> this.Process<RefRecord>(Array.groupBy)
 
-    [<Benchmark()>]
+    [<Benchmark(Baseline=true)>]
     member this.PLINQ () = 
         match this.Type with
         | ElementType.StructRecord -> this.Process<StructRecord>(PLINQImplementation.groupBy)
         | ElementType.RefRecord -> this.Process<RefRecord>(PLINQImplementation.groupBy)
 
-    [<Benchmark()>]
+    //[<Benchmark()>]
     member this.Hybrid () = 
         match this.Type with
         | ElementType.StructRecord -> this.Process<StructRecord>(JunkyardOfBadIdeas.countByWithArrayInConcurrentDict)
         | ElementType.RefRecord -> this.Process<RefRecord>(CustomImpl.eachChunkSeparatelyThenMerge)
 
-    [<Benchmark()>]
+    //[<Benchmark()>]
     member this.EachChunkSeparatelyThenMerge () = 
         match this.Type with
         | ElementType.StructRecord -> this.Process<StructRecord>(CustomImpl.eachChunkSeparatelyThenMerge)
@@ -579,7 +580,7 @@ type ArrayParallelGroupByBenchMarkAllInOne()   =
         | ElementType.StructRecord -> this.Process<StructRecord>(JunkyardOfBadIdeas.countByThenAssignHandRolled)
         | ElementType.RefRecord -> this.Process<RefRecord>(JunkyardOfBadIdeas.countByThenAssignHandRolled)
 
-    [<Benchmark>]
+    //[<Benchmark>]
     member this.CustomCounterType () = 
         match this.Type with
         | ElementType.StructRecord -> this.Process<StructRecord>(JunkyardOfBadIdeas.countByWithArrayInConcurrentDict)
